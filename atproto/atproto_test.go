@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"testing"
 	"time"
 
@@ -87,71 +88,83 @@ func TestConfigKeyBindingKeepsSSHKey(t *testing.T) {
 }
 
 func TestVerifier(t *testing.T) {
-	ctx := context.Background()
+	const pds = "https://pds.example.com"
+	webDID := syntax.DID("did:web:attacker.example")
+
 	accountKey, err := atcrypto.GeneratePrivateKeyP256()
 	require.NoError(t, err)
 	accountPub, err := accountKey.PublicKey()
 	require.NoError(t, err)
+	wrongKey, err := atcrypto.GeneratePrivateKeyP256()
+	require.NoError(t, err)
 	dir := identity.NewMockDirectory()
-	dir.Insert(identity.Identity{
-		DID: testDID,
-		Keys: map[string]identity.VerificationMethod{
-			"atproto": {Type: "Multikey", PublicKeyMultibase: accountPub.Multibase()},
-		},
-	})
-	v := &Verifier{issuer: testIssuer, dir: dir}
+	for _, did := range []syntax.DID{testDID, webDID} {
+		dir.Insert(identity.Identity{
+			DID:      did,
+			Keys:     map[string]identity.VerificationMethod{"atproto": {Type: "Multikey", PublicKeyMultibase: accountPub.Multibase()}},
+			Services: map[string]identity.ServiceEndpoint{"atproto_pds": {Type: "AtprotoPersonalDataServer", URL: pds}},
+		})
+	}
 
 	sshKey, cic := newCIC(t)
 	_, otherCIC := newCIC(t)
 
-	accessToken := func(cnfKey crypto.PublicKey) []byte {
-		payload, err := json.Marshal(map[string]any{
+	accessToken := func(sub syntax.DID, bound *clientinstance.Claims, extra map[string]any) []byte {
+		claims := map[string]any{
 			"iss":   testIssuer,
-			"sub":   testDID,
+			"sub":   sub,
 			"aud":   "did:web:pds.example.com",
 			"scope": scope,
 			"exp":   time.Now().Add(time.Hour).Unix(),
-			"cnf":   map[string]string{"jkt": jkt(t, cnfKey)},
-		})
+			"cnf":   map[string]string{"jkt": jkt(t, bound.PublicKey())},
+		}
+		maps.Copy(claims, extra)
+		payload, err := json.Marshal(claims)
 		require.NoError(t, err)
 		token, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), sshKey)) // signature is not checked
 		require.NoError(t, err)
 		return token
 	}
-	serviceAuth := func(key atcrypto.PrivateKey, cic *clientinstance.Claims, lxm syntax.NSID) []byte {
-		aud, err := audience(testDID.String(), cic)
+	serviceAuth := func(iss syntax.DID, key atcrypto.PrivateKey, cic *clientinstance.Claims, lxm syntax.NSID) []byte {
+		aud, err := audience(iss.String(), cic)
 		require.NoError(t, err)
-		token, err := auth.SignServiceAuth(testDID, aud, time.Hour, &lxm, key)
+		token, err := auth.SignServiceAuth(iss, aud, time.Hour, &lxm, key)
 		require.NoError(t, err)
 		return []byte(token)
 	}
-	pkToken := func(access, fresh []byte) *pktoken.PKToken {
-		cicToken, err := cic.Sign(sshKey, jose.ES256, access)
-		require.NoError(t, err)
-		pkt, err := pktoken.New(access, cicToken)
-		require.NoError(t, err)
-		pkt.FreshIDToken = fresh
-		return pkt
-	}
 
-	valid := accessToken(cic.PublicKey())
-	require.NoError(t, v.VerifyIDToken(ctx, valid, cic))
-	require.ErrorContains(t, v.VerifyIDToken(ctx, accessToken(otherCIC.PublicKey()), cic), "not bound to the SSH key")
-
-	wrongKey, err := atcrypto.GeneratePrivateKeyP256()
-	require.NoError(t, err)
+	access := accessToken(testDID, cic, nil)
+	fresh := serviceAuth(testDID, accountKey, cic, serviceAuthMethod)
 	for name, tc := range map[string]struct {
-		fresh   []byte
-		wantErr string
+		access, fresh []byte
+		authServer    string
+		wantErr       string
 	}{
-		"valid":         {serviceAuth(accountKey, cic, serviceAuthMethod), ""},
-		"missing":       {nil, "invalid service auth token"},
-		"other SSH key": {serviceAuth(accountKey, otherCIC, serviceAuthMethod), "invalid service auth token"},
-		"wrong signer":  {serviceAuth(wrongKey, cic, serviceAuthMethod), "invalid service auth token"},
-		"wrong method":  {serviceAuth(accountKey, cic, "com.example.other"), "invalid service auth token"},
+		"valid":                            {access, fresh, testIssuer, ""},
+		"access token for another SSH key": {accessToken(testDID, otherCIC, nil), fresh, testIssuer, "not bound to the SSH key"},
+		"forged email claim":               {accessToken(testDID, cic, map[string]any{"email": "root@example.com"}), fresh, testIssuer, `unexpected claim "email"`},
+		"no service auth token":            {access, nil, testIssuer, "invalid service auth token"},
+		"service auth for another SSH key": {access, serviceAuth(testDID, accountKey, otherCIC, serviceAuthMethod), testIssuer, "invalid service auth token"},
+		"service auth with wrong key":      {access, serviceAuth(testDID, wrongKey, cic, serviceAuthMethod), testIssuer, "invalid service auth token"},
+		"service auth for another method":  {access, serviceAuth(testDID, accountKey, cic, "com.example.other"), testIssuer, "invalid service auth token"},
+		"did:web account":                  {accessToken(webDID, cic, nil), serviceAuth(webDID, accountKey, cic, serviceAuthMethod), testIssuer, "only did:plc"},
+		"account on another issuer":        {access, fresh, "https://other.example", "uses authorization server https://other.example"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := v.VerifyServiceAuth(ctx, pkToken(valid, tc.fresh))
+			v := &Verifier{issuer: testIssuer, dir: dir, authServer: func(_ context.Context, pdsURL string) (string, error) {
+				require.Equal(t, pds, pdsURL)
+				return tc.authServer, nil
+			}}
+			cicToken, err := cic.Sign(sshKey, jose.ES256, tc.access)
+			require.NoError(t, err)
+			pkt, err := pktoken.New(tc.access, cicToken)
+			require.NoError(t, err)
+			pkt.FreshIDToken = tc.fresh
+
+			err = v.VerifyIDToken(context.Background(), tc.access, cic)
+			if err == nil {
+				err = v.VerifyServiceAuth(context.Background(), pkt)
+			}
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 			} else {

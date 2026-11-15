@@ -302,6 +302,24 @@ func TestProvidersFileLoader_FromTable(t *testing.T) {
 	}
 }
 
+// atproto rows take no expiration column: the unsigned access token's iat and
+// exp must never decide how long a PK token is accepted.
+func TestProvidersFileLoader_FromTable_Atproto(t *testing.T) {
+	loader := ProvidersFileLoader{}
+	policy := loader.FromTable([]byte("https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO\n"+
+		"https://other.example OPENPUBKEY-PKTOKEN:ATPROTO 24h\n"), "dummy-path")
+	require.Len(t, policy.rows, 1, "a row with an expiration column is rejected")
+	require.Equal(t, ProvidersRow{Issuer: "https://bsky.social", ClientID: atprotoClientID}, policy.rows[0])
+
+	expiration, err := policy.rows[0].GetExpirationPolicy()
+	require.NoError(t, err)
+	require.Equal(t, verifier.ExpirationPolicies.NEVER_EXPIRE, expiration)
+
+	v, err := policy.CreateVerifier(discover.DiscoveryCacheConfig{})
+	require.NoError(t, err)
+	require.Contains(t, v.atproto, "https://bsky.social")
+}
+
 // Test ProvidersFileLoader.ToTable.
 func testJWT(t *testing.T, payload map[string]any) string {
 	t.Helper()

@@ -24,8 +24,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/bluesky-social/indigo/atproto/auth"
+	"github.com/bluesky-social/indigo/atproto/auth/oauth"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -39,16 +41,26 @@ import (
 // audience.
 const serviceAuthMethod = syntax.NSID("com.opkssh.sshLogin")
 
+// accessTokenClaims lists the claims atproto access tokens carry. Servers
+// cannot check the token's signature, and policy reads claims from it, so any
+// other claim (email, groups, ...) would be chosen by the client.
+var accessTokenClaims = []string{"iss", "sub", "aud", "exp", "iat", "jti", "scope", "cnf", "client_id"}
+
 // Verifier verifies atproto PK tokens on SSH servers.
 type Verifier struct {
-	issuer string
-	dir    identity.Directory
+	issuer     string
+	dir        identity.Directory
+	authServer func(ctx context.Context, pdsURL string) (string, error)
 }
 
-// NewVerifier returns a Verifier for access tokens issued by issuer, such as
-// https://bsky.social.
+// NewVerifier returns a Verifier for accounts whose PDS uses the authorization
+// server issuer, such as https://bsky.social.
 func NewVerifier(issuer string) *Verifier {
-	return &Verifier{issuer: issuer, dir: identity.DefaultDirectory()}
+	return &Verifier{
+		issuer:     issuer,
+		dir:        identity.DefaultDirectory(),
+		authServer: oauth.NewResolver().ResolveAuthServerURL,
+	}
 }
 
 func (v *Verifier) Issuer() string { return v.issuer }
@@ -62,13 +74,10 @@ func (v *Verifier) VerifyIDToken(_ context.Context, idt []byte, cic *clientinsta
 
 // VerifyServiceAuth verifies the service auth token in pkt: it must be signed
 // by the DID key of the access token's subject, be for serviceAuthMethod,
-// unexpired, and its audience must commit to pkt's CIC.
-//
-// ponytail: the account DID is the verified identity; the issuer is not checked
-// against the DID's PDS. Resolve DID -> PDS -> authorization server here if a
-// providers row must mean "accounts hosted by this issuer".
+// unexpired, and its audience must commit to pkt's CIC. The subject's PDS must
+// use v's authorization server.
 func (v *Verifier) VerifyServiceAuth(ctx context.Context, pkt *pktoken.PKToken) error {
-	var access accessTokenClaims
+	var access accessToken
 	if err := json.Unmarshal(pkt.Payload, &access); err != nil {
 		return err
 	}
@@ -80,7 +89,8 @@ func (v *Verifier) VerifyServiceAuth(ctx context.Context, pkt *pktoken.PKToken) 
 	if err != nil {
 		return err
 	}
-	validator := auth.ServiceAuthValidator{Audience: aud, Dir: v.dir}
+	dir := plcOnly{v.dir}
+	validator := auth.ServiceAuthValidator{Audience: aud, Dir: dir}
 	method := serviceAuthMethod
 	did, err := validator.Validate(ctx, string(pkt.FreshIDToken), &method)
 	if err != nil {
@@ -89,10 +99,38 @@ func (v *Verifier) VerifyServiceAuth(ctx context.Context, pkt *pktoken.PKToken) 
 	if did.String() != access.Sub {
 		return fmt.Errorf("atproto: service auth token issued by %s, expected %s", did, access.Sub)
 	}
+
+	// The access token's iss is unsigned, so bind the issuer through the DID
+	// document instead: the account's PDS must use this authorization server.
+	ident, err := dir.LookupDID(ctx, did)
+	if err != nil {
+		return fmt.Errorf("atproto: resolving %s: %w", did, err)
+	}
+	asURL, err := v.authServer(ctx, ident.PDSEndpoint())
+	if err != nil {
+		return fmt.Errorf("atproto: resolving authorization server of %s: %w", did, err)
+	}
+	if asURL != v.issuer {
+		return fmt.Errorf("atproto: %s uses authorization server %s, expected %s", did, asURL, v.issuer)
+	}
 	return nil
 }
 
-type accessTokenClaims struct {
+// plcOnly resolves only did:plc identities, from plc.directory. Resolving a
+// did:web would make the server fetch from a host an unauthenticated client
+// chose.
+//
+// ponytail: did:web accounts cannot log in; add an opt-in if they must.
+type plcOnly struct{ identity.Directory }
+
+func (d plcOnly) LookupDID(ctx context.Context, did syntax.DID) (*identity.Identity, error) {
+	if did.Method() != "plc" {
+		return nil, fmt.Errorf("atproto: %s: only did:plc accounts are supported", did)
+	}
+	return d.Directory.LookupDID(ctx, did)
+}
+
+type accessToken struct {
 	Iss string `json:"iss"`
 	Sub string `json:"sub"`
 	Cnf struct {
@@ -100,14 +138,23 @@ type accessTokenClaims struct {
 	} `json:"cnf"`
 }
 
-// verifyAccessToken checks an access token's issuer, without its signature,
+// verifyAccessToken checks an access token's claims, without its signature,
 // and that its DPoP key (cnf.jkt) is the CIC key.
-func verifyAccessToken(token []byte, cic *clientinstance.Claims, issuer string) (*accessTokenClaims, error) {
+func verifyAccessToken(token []byte, cic *clientinstance.Claims, issuer string) (*accessToken, error) {
 	msg, err := jws.Parse(token)
 	if err != nil {
 		return nil, fmt.Errorf("atproto: parsing access token: %w", err)
 	}
-	var claims accessTokenClaims
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(msg.Payload(), &raw); err != nil {
+		return nil, fmt.Errorf("atproto: parsing access token: %w", err)
+	}
+	for name := range raw {
+		if !slices.Contains(accessTokenClaims, name) {
+			return nil, fmt.Errorf("atproto: access token has unexpected claim %q", name)
+		}
+	}
+	var claims accessToken
 	if err := json.Unmarshal(msg.Payload(), &claims); err != nil {
 		return nil, fmt.Errorf("atproto: parsing access token: %w", err)
 	}

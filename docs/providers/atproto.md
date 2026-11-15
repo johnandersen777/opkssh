@@ -20,21 +20,39 @@ providers:
 With `issuer: atproto://`, the handle is read from `$ATPROTO_HANDLE`. Login
 requires the default `--key-type ecdsa`, because atproto DPoP uses ES256.
 
+## Before you allow atproto logins
+
+**Anything that can act as the account can get SSH access as it.** That
+includes the account password, every app password, and every app the user
+has granted broad access (such as `transition:generic`). Any of them can ask
+the PDS for the token opkssh logins rest on, and servers cannot tell which
+one did. Grant SSH access only to accounts whose owners keep those
+credentials as tightly as they would an SSH key.
+
 ## Servers
 
 Add the authorization server to `/etc/opk/providers` with the
-`OPENPUBKEY-PKTOKEN:ATPROTO` client ID, and allow account DIDs in `auth_id`:
+`OPENPUBKEY-PKTOKEN:ATPROTO` client ID and no expiration column, and allow
+account DIDs in `auth_id`:
 
 ```bash
 # /etc/opk/providers
-https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO 24h
+https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO
 
 # /etc/opk/auth_id
 alice did:plc:lpfuqerea3deuoyrn7ojser4 https://bsky.social
 ```
 
-Certificates stop verifying after about an hour, whatever the expiration
-policy, when the service auth token below expires.
+- Match atproto accounts on their DID only. The verified identity is the
+  account DID; other claims are rejected, so rows matching on email or other
+  claims never match.
+- The issuer is the account's authorization server: the row above admits only
+  accounts whose PDS uses `https://bsky.social`.
+- Only `did:plc` accounts can log in.
+- Certificates are valid for about an hour; run `opkssh login` again after
+  that. There is no expiration column because the only trustworthy expiry is
+  that of the service auth token below, which the PDS issues for at most an
+  hour.
 
 ## How it works
 
@@ -47,7 +65,10 @@ bsky.social do not publish their signing key. Login therefore also asks the PDS
 for a service auth token (`com.atproto.server.getServiceAuth`) for the method
 `com.opkssh.sshLogin`, whose audience (`<account DID>#<hash>`) commits to the
 SSH key. The account's repo key signs it, and the account's DID document
-publishes that key, so servers verify it against the DID document.
+publishes that key, so servers verify it against the DID document. Servers also
+check that the account's PDS uses the issuer's authorization server, and accept
+only the claims atproto access tokens carry.
 
 Login requests only the scope `atproto rpc:com.opkssh.sshLogin?aud=*`: the
-consent screen asks to call that one method, which only opkssh accepts.
+consent screen asks to call that one method, which only opkssh accepts. Login
+revokes its OAuth session as soon as it has the service auth token.

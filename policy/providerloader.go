@@ -34,7 +34,8 @@ import (
 )
 
 // atprotoClientID marks a providers row as an atproto authorization server,
-// e.g. "https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO 24h".
+// e.g. "https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO". These rows have no
+// expiration column; see GetExpirationPolicy.
 const atprotoClientID = "OPENPUBKEY-PKTOKEN:ATPROTO"
 
 type ProvidersRow struct {
@@ -44,6 +45,12 @@ type ProvidersRow struct {
 }
 
 func (p ProvidersRow) GetExpirationPolicy() (verifier.ExpirationPolicy, error) {
+	// The iat and exp of atproto access tokens are unsigned, so no policy
+	// based on them means anything. atproto.Verifier enforces the signed
+	// service auth token's exp (an hour at most) instead.
+	if p.ClientID == atprotoClientID {
+		return verifier.ExpirationPolicies.NEVER_EXPIRE, nil
+	}
 	switch p.ExpirationPolicy {
 	case "12h":
 		return verifier.ExpirationPolicies.MAX_AGE_12HOURS, nil
@@ -364,21 +371,26 @@ func (o *ProvidersFileLoader) FromTable(input []byte, path string) *ProviderPoli
 		rows: []ProvidersRow{},
 	}
 	for _, row := range table.GetRows() {
+		// atproto rows have no expiration column, so that none is mistaken
+		// for having an effect.
+		want := 3
+		if len(row) >= 2 && row[1] == atprotoClientID {
+			want = 2
+		}
 		// Error should not break everyone's ability to login, skip those rows
-		if len(row) != 3 {
+		if len(row) != want {
 			configProblem := files.ConfigProblem{
 				Filepath:      path,
 				OffendingLine: strings.Join(row, " "),
-				ErrorMessage:  fmt.Sprintf("wrong number of arguments (expected=3, got=%d)", len(row)),
+				ErrorMessage:  fmt.Sprintf("wrong number of arguments (expected=%d, got=%d)", want, len(row)),
 				Source:        "providers policy file",
 			}
 			files.ConfigProblems().RecordProblem(configProblem)
 			continue
 		}
-		policyRow := ProvidersRow{
-			Issuer:           row[0],
-			ClientID:         row[1],
-			ExpirationPolicy: row[2], // TODO: Validate this so that we can determine the line number that has the error
+		policyRow := ProvidersRow{Issuer: row[0], ClientID: row[1]}
+		if want == 3 {
+			policyRow.ExpirationPolicy = row[2] // TODO: Validate this so that we can determine the line number that has the error
 		}
 		policy.AddRow(policyRow)
 	}

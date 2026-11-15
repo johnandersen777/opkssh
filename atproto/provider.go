@@ -216,14 +216,32 @@ func (p *Provider) RequestTokens(ctx context.Context, cic *clientinstance.Claims
 		return nil, fmt.Errorf("atproto: token issued for %s, expected %s", tok.Subject, p.did)
 	}
 
-	if p.serviceAuth, err = p.fetchServiceAuth(ctx, app, tok.AccessToken, cic); err != nil {
+	sess := &oauth.ClientSession{
+		Client: app.Client,
+		Config: app.Config,
+		Data: &oauth.ClientSessionData{
+			AccountDID:                   p.did,
+			HostURL:                      p.pdsURL,
+			AuthServerURL:                p.meta.Issuer,
+			AuthServerTokenEndpoint:      p.meta.TokenEndpoint,
+			AuthServerRevocationEndpoint: p.meta.RevocationEndpoint,
+			AccessToken:                  tok.AccessToken,
+			RefreshToken:                 tok.RefreshToken,
+		},
+		DPoPPrivateKey:         p.key,
+		PersistSessionCallback: func(context.Context, *oauth.ClientSessionData) {},
+	}
+	serviceAuth, err := fetchServiceAuth(ctx, sess, cic)
+	// The session exists only to get that token. Revoke it so it does not stay
+	// behind as a connected app with access to the account.
+	if rerr := sess.RevokeSession(ctx); rerr != nil {
+		fmt.Fprintf(p.ErrWriter(), "Warning: failed to revoke atproto session: %v\n", rerr)
+	}
+	if err != nil {
 		return nil, err
 	}
-	return &simpleoidc.Tokens{
-		IDToken:      []byte(tok.AccessToken),
-		AccessToken:  []byte(tok.AccessToken),
-		RefreshToken: []byte(tok.RefreshToken),
-	}, nil
+	p.serviceAuth = serviceAuth
+	return &simpleoidc.Tokens{IDToken: []byte(tok.AccessToken), AccessToken: []byte(tok.AccessToken)}, nil
 }
 
 // pushAuthRequest sends the PAR request with a DPoP proof from the SSH key,
@@ -273,22 +291,10 @@ func (p *Provider) pushAuthRequest(ctx context.Context, client *http.Client, for
 
 // fetchServiceAuth asks the PDS for a service auth token whose audience
 // commits to cic.
-func (p *Provider) fetchServiceAuth(ctx context.Context, app *oauth.ClientApp, accessToken string, cic *clientinstance.Claims) ([]byte, error) {
-	aud, err := audience(p.did.String(), cic)
+func fetchServiceAuth(ctx context.Context, sess *oauth.ClientSession, cic *clientinstance.Claims) ([]byte, error) {
+	aud, err := audience(sess.Data.AccountDID.String(), cic)
 	if err != nil {
 		return nil, err
-	}
-	sess := &oauth.ClientSession{
-		Client: app.Client,
-		Config: app.Config,
-		Data: &oauth.ClientSessionData{
-			AccountDID:    p.did,
-			HostURL:       p.pdsURL,
-			AuthServerURL: p.meta.Issuer,
-			AccessToken:   accessToken,
-		},
-		DPoPPrivateKey:         p.key,
-		PersistSessionCallback: func(context.Context, *oauth.ClientSessionData) {},
 	}
 	var out struct {
 		Token string `json:"token"`
