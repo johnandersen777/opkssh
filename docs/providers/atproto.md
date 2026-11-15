@@ -44,9 +44,10 @@ it to the SSH key.
 
 Servers cannot check the access token's signature, because entryways such as
 bsky.social do not publish their signing key. Login therefore also asks the PDS
-for a service auth token (`com.atproto.server.getServiceAuth`) whose `lxm`
-commits to the SSH key. The account's repo key signs it, and the account's DID
-document publishes that key, so servers verify it against the DID document.
+for a service auth token (`com.atproto.server.getServiceAuth`) for the method
+`com.opkssh.sshLogin`, whose audience (`<account DID>#<hash>`) commits to the
+SSH key. The account's repo key signs it, and the account's DID document
+publishes that key, so servers verify it against the DID document.
 
-Requesting that token needs the `transition:generic` scope, so the consent
-screen asks for broad access to the account.
+Login requests only the scope `atproto rpc:com.opkssh.sshLogin?aud=*`: the
+consent screen asks to call that one method, which only opkssh accepts.

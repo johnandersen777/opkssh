@@ -57,9 +57,8 @@ import (
 )
 
 const (
-	// transition:generic lets the session request a service auth token with
-	// a custom lxm.
-	scope        = "atproto transition:generic"
+	// scope grants only service auth tokens for serviceAuthMethod.
+	scope        = "atproto rpc:" + string(serviceAuthMethod) + "?aud=*"
 	callbackPath = "/callback"
 	flowTimeout  = 5 * time.Minute
 )
@@ -272,10 +271,10 @@ func (p *Provider) pushAuthRequest(ctx context.Context, client *http.Client, for
 	}
 }
 
-// fetchServiceAuth asks the PDS for a service auth token whose lxm commits to
-// cic.
+// fetchServiceAuth asks the PDS for a service auth token whose audience
+// commits to cic.
 func (p *Provider) fetchServiceAuth(ctx context.Context, app *oauth.ClientApp, accessToken string, cic *clientinstance.Claims) ([]byte, error) {
-	lxm, err := commitment(cic)
+	aud, err := audience(p.did.String(), cic)
 	if err != nil {
 		return nil, err
 	}
@@ -295,8 +294,8 @@ func (p *Provider) fetchServiceAuth(ctx context.Context, app *oauth.ClientApp, a
 		Token string `json:"token"`
 	}
 	if err := sess.APIClient().Get(ctx, "com.atproto.server.getServiceAuth", map[string]any{
-		"aud": p.did.String(),
-		"lxm": lxm.String(),
+		"aud": aud,
+		"lxm": serviceAuthMethod.String(),
 		// The PDS caps tokens with an lxm at one hour; leave room for skew.
 		"exp": time.Now().Add(59 * time.Minute).Unix(),
 	}, &out); err != nil {

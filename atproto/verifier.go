@@ -34,6 +34,11 @@ import (
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 )
 
+// serviceAuthMethod is the lxm of the service auth token login requests. Only
+// opkssh accepts it, so login's scope grants just this method, for any
+// audience.
+const serviceAuthMethod = syntax.NSID("com.opkssh.sshLogin")
+
 // Verifier verifies atproto PK tokens on SSH servers.
 type Verifier struct {
 	issuer string
@@ -56,8 +61,8 @@ func (v *Verifier) VerifyIDToken(_ context.Context, idt []byte, cic *clientinsta
 }
 
 // VerifyServiceAuth verifies the service auth token in pkt: it must be signed
-// by the DID key of the access token's subject, addressed to that DID,
-// unexpired, and commit to pkt's CIC.
+// by the DID key of the access token's subject, be for serviceAuthMethod,
+// unexpired, and its audience must commit to pkt's CIC.
 //
 // ponytail: the account DID is the verified identity; the issuer is not checked
 // against the DID's PDS. Resolve DID -> PDS -> authorization server here if a
@@ -71,12 +76,13 @@ func (v *Verifier) VerifyServiceAuth(ctx context.Context, pkt *pktoken.PKToken) 
 	if err != nil {
 		return err
 	}
-	lxm, err := commitment(cic)
+	aud, err := audience(access.Sub, cic)
 	if err != nil {
 		return err
 	}
-	validator := auth.ServiceAuthValidator{Audience: access.Sub, Dir: v.dir}
-	did, err := validator.Validate(ctx, string(pkt.FreshIDToken), &lxm)
+	validator := auth.ServiceAuthValidator{Audience: aud, Dir: v.dir}
+	method := serviceAuthMethod
+	did, err := validator.Validate(ctx, string(pkt.FreshIDToken), &method)
 	if err != nil {
 		return fmt.Errorf("atproto: invalid service auth token: %w", err)
 	}
@@ -122,10 +128,10 @@ func verifyAccessToken(token []byte, cic *clientinstance.Claims, issuer string) 
 	return &claims, nil
 }
 
-// commitment returns the service auth lxm that commits to cic: an NSID whose
-// name is "cic" plus the base32 CIC hash. The prefix keeps the name starting
-// with a letter, as NSIDs require, and it fits the 63 character limit.
-func commitment(cic *clientinstance.Claims) (syntax.NSID, error) {
+// audience returns the service auth audience that commits to cic: the account
+// DID with the base32 CIC hash as its fragment, a DID reference getServiceAuth
+// accepts.
+func audience(did string, cic *clientinstance.Claims) (string, error) {
 	hash, err := cic.Hash() // base64url text of a SHA3-256 digest
 	if err != nil {
 		return "", err
@@ -134,5 +140,5 @@ func commitment(cic *clientinstance.Claims) (syntax.NSID, error) {
 	if err != nil {
 		return "", err
 	}
-	return syntax.ParseNSID("com.opkssh.cic" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(digest))
+	return did + "#" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(digest), nil
 }

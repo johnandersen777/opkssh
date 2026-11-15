@@ -86,18 +86,6 @@ func TestConfigKeyBindingKeepsSSHKey(t *testing.T) {
 	require.Error(t, p.ConfigKeyBinding(key, "EdDSA"))
 }
 
-// NSID names cannot start with a digit, which a bare base32 hash sometimes does.
-func TestCommitmentIsValidNSID(t *testing.T) {
-	for range 200 {
-		_, cic := newCIC(t)
-		lxm, err := commitment(cic)
-		require.NoError(t, err)
-		again, err := commitment(cic)
-		require.NoError(t, err)
-		require.Equal(t, lxm, again)
-	}
-}
-
 func TestVerifier(t *testing.T) {
 	ctx := context.Background()
 	accountKey, err := atcrypto.GeneratePrivateKeyP256()
@@ -121,7 +109,7 @@ func TestVerifier(t *testing.T) {
 			"iss":   testIssuer,
 			"sub":   testDID,
 			"aud":   "did:web:pds.example.com",
-			"scope": "atproto transition:generic",
+			"scope": scope,
 			"exp":   time.Now().Add(time.Hour).Unix(),
 			"cnf":   map[string]string{"jkt": jkt(t, cnfKey)},
 		})
@@ -130,8 +118,8 @@ func TestVerifier(t *testing.T) {
 		require.NoError(t, err)
 		return token
 	}
-	serviceAuth := func(key atcrypto.PrivateKey, aud string, cic *clientinstance.Claims) []byte {
-		lxm, err := commitment(cic)
+	serviceAuth := func(key atcrypto.PrivateKey, cic *clientinstance.Claims, lxm syntax.NSID) []byte {
+		aud, err := audience(testDID.String(), cic)
 		require.NoError(t, err)
 		token, err := auth.SignServiceAuth(testDID, aud, time.Hour, &lxm, key)
 		require.NoError(t, err)
@@ -156,11 +144,11 @@ func TestVerifier(t *testing.T) {
 		fresh   []byte
 		wantErr string
 	}{
-		"valid":         {serviceAuth(accountKey, testDID.String(), cic), ""},
+		"valid":         {serviceAuth(accountKey, cic, serviceAuthMethod), ""},
 		"missing":       {nil, "invalid service auth token"},
-		"other SSH key": {serviceAuth(accountKey, testDID.String(), otherCIC), "invalid service auth token"},
-		"wrong signer":  {serviceAuth(wrongKey, testDID.String(), cic), "invalid service auth token"},
-		"wrong aud":     {serviceAuth(accountKey, "did:web:example.com", cic), "invalid service auth token"},
+		"other SSH key": {serviceAuth(accountKey, otherCIC, serviceAuthMethod), "invalid service auth token"},
+		"wrong signer":  {serviceAuth(wrongKey, cic, serviceAuthMethod), "invalid service auth token"},
+		"wrong method":  {serviceAuth(accountKey, cic, "com.example.other"), "invalid service auth token"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := v.VerifyServiceAuth(ctx, pkToken(valid, tc.fresh))
