@@ -406,7 +406,7 @@ Arguments:
 				log.Println("Failed to create pk token verifier (likely bad provider configuration):", err)
 				return err
 			}
-			v.PktVerifier = *pktVerifier
+			v.PktVerifier = pktVerifier
 
 			if authKey, err := v.AuthorizedKeysCommand(ctx, userArg, typArg, certB64Arg, extraArgs); err != nil {
 				log.Println("failed to verify:", err)

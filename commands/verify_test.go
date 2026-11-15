@@ -212,7 +212,7 @@ func TestAuthorizedKeysCommand(t *testing.T) {
 
 			userArg := "user"
 			ver := VerifyCmd{
-				PktVerifier: *verPkt,
+				PktVerifier: verPkt,
 				CheckPolicy: tt.policyFunc,
 				HttpClient:  mocks.NewMockGoogleUserInfoHTTPClient(userInfoResponse, expectedAccessToken),
 			}
@@ -369,7 +369,7 @@ func TestAuthorizedKeysCommandSameIssuer_TwoClientIDs(t *testing.T) {
 
 			userArg := "user"
 			ver := VerifyCmd{
-				PktVerifier: *verPkt,
+				PktVerifier: verPkt,
 				CheckPolicy: AllowAllPolicyEnforcer,
 			}
 

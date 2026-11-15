@@ -51,7 +51,7 @@ type VerifyCmd struct {
 	Fs afero.Fs
 	// PktVerifier is responsible for verifying the PK token
 	// contained in the SSH certificate
-	PktVerifier verifier.Verifier
+	PktVerifier sshcert.PKTokenVerifier
 	// CheckPolicy determines whether the verified PK token is permitted to SSH as a
 	// specific user
 	CheckPolicy PolicyEnforcerFunc

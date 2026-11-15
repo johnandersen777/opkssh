@@ -169,7 +169,7 @@ func TestSshCertCreation(t *testing.T) {
 				op,
 			)
 			require.NoError(t, err)
-			pktRet, err := certSmug.VerifySshPktCert(context.Background(), *pktVerifier)
+			pktRet, err := certSmug.VerifySshPktCert(context.Background(), pktVerifier)
 			require.NoError(t, err)
 			require.NotNil(t, pktRet)
 			require.Equal(t, pktSet, pktRet, "expected pktSet to be equal to pktRet")

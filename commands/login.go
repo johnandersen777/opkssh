@@ -574,6 +574,15 @@ func (l *LoginCmd) login(ctx context.Context, provider providers.OpenIdProvider,
 
 	l.pkt = pkt
 
+	// Some providers obtain a second, publicly verifiable proof during login
+	// (atproto's PDS-signed service auth token). Attach it before the PK token
+	// is serialized into the SSH certificate.
+	if attacher, ok := provider.(interface{ AttachServiceAuth(*pktoken.PKToken) error }); ok {
+		if err := attacher.AttachServiceAuth(pkt); err != nil {
+			return nil, err
+		}
+	}
+
 	var accessToken []byte
 	if l.SendAccessTokenArg {
 		accessToken = opkClient.GetAccessToken()

@@ -57,7 +57,7 @@ func TestLoginAndVerifyWithEd25519AlgInJwks(t *testing.T) {
 	pktVerifier, err := providerPolicy.CreateVerifier(discover.DiscoveryCacheConfig{})
 	require.NoError(t, err)
 	verifyCmd := commands.VerifyCmd{
-		PktVerifier: *pktVerifier,
+		PktVerifier: pktVerifier,
 		CheckPolicy: allowAnyUser,
 	}
 	authorizedKey, err := verifyCmd.AuthorizedKeysCommand(TestCtx, "test-user",

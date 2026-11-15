@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/openpubkey/openpubkey/providers"
+	"github.com/openpubkey/opkssh/atproto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -242,6 +243,12 @@ func NewProviderConfigFromString(configStr string, hasAlias bool) (ProviderConfi
 
 // NewProviderFromConfig is a function to create the provider from the config
 func (p *ProviderConfig) ToProvider(openBrowser bool) (providers.OpenIdProvider, error) {
+	// atproto://<handle> is not an OpenID issuer. The handle is resolved to the
+	// account DID, then to the account's PDS and OAuth authorization server.
+	if handle, ok := strings.CutPrefix(p.Issuer, "atproto://"); ok {
+		return atproto.NewAtprotoOp(handle, openBrowser)
+	}
+
 	if p.Issuer == "" {
 		return nil, fmt.Errorf("invalid provider issuer value got (%s)", p.Issuer)
 	}

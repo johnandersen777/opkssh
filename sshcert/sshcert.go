@@ -33,6 +33,13 @@ type SshCertSmuggler struct {
 	SshCert *ssh.Certificate
 }
 
+// PKTokenVerifier verifies the PK token in an SSH certificate. It is an
+// interface so policy can wrap the generic verifier with provider-specific
+// checks that need the whole PK token.
+type PKTokenVerifier interface {
+	VerifyPKToken(ctx context.Context, pkt *pktoken.PKToken, extraChecks ...verifier.Check) error
+}
+
 func New(pkt *pktoken.PKToken, accessToken []byte, principals []string) (*SshCertSmuggler, error) {
 
 	// TODO: assumes email exists in ID Token,
@@ -131,7 +138,7 @@ func (s *SshCertSmuggler) GetAccessToken() string {
 	return ""
 }
 
-func (s *SshCertSmuggler) VerifySshPktCert(ctx context.Context, pktVerifier verifier.Verifier) (*pktoken.PKToken, error) {
+func (s *SshCertSmuggler) VerifySshPktCert(ctx context.Context, pktVerifier PKTokenVerifier) (*pktoken.PKToken, error) {
 	pkt, err := s.GetPKToken()
 	if err != nil {
 		return nil, fmt.Errorf("openpubkey-pkt extension in cert failed deserialization: %w", err)

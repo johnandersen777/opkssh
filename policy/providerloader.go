@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/openpubkey/openpubkey/discover"
+	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/providers"
 	"github.com/openpubkey/openpubkey/verifier"
@@ -110,6 +111,8 @@ func providerVerifierFromRow(row ProvidersRow, cacheCfg discover.DiscoveryCacheC
 			audience:        row.ClientID,
 			publicKeyFinder: newCachedPublicKeyFinder(cacheCfg),
 		}
+	} else if row.ClientID == atprotoClientIDMarker {
+		return atprotoProviderVerifier{issuer: row.Issuer}
 	} else if row.Issuer == "https://gitlab.com" {
 		opts := providers.GetDefaultGitlabOpOptions()
 		opts.Issuer = row.Issuer
@@ -127,12 +130,22 @@ func providerVerifierFromRow(row ProvidersRow, cacheCfg discover.DiscoveryCacheC
 	return providers.NewGoogleOpWithOptions(opts)
 }
 
-func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) (*verifier.Verifier, error) {
+// PKTokenVerifier verifies a PK token. It is implemented by the generic
+// verifier and by policy wrappers that add provider-specific checks.
+type PKTokenVerifier interface {
+	VerifyPKToken(ctx context.Context, pkt *pktoken.PKToken, extraChecks ...verifier.Check) error
+}
+
+func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) (PKTokenVerifier, error) {
 	pvs := []verifier.ProviderVerifier{}
+	atprotoIssuers := map[string]struct{}{}
 	var expirationPolicy verifier.ExpirationPolicy
 	var err error
 	for _, row := range p.rows {
 		provider := providerVerifierFromRow(row, cacheCfg)
+		if row.ClientID == atprotoClientIDMarker {
+			atprotoIssuers[row.Issuer] = struct{}{}
+		}
 
 		expirationPolicy, err = row.GetExpirationPolicy()
 		if err != nil {
@@ -154,6 +167,9 @@ func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) 
 	)
 	if err != nil {
 		return nil, err
+	}
+	if len(atprotoIssuers) > 0 {
+		return &atprotoPolicyVerifier{Verifier: pktVerifier, atprotoIssuers: atprotoIssuers}, nil
 	}
 	return pktVerifier, nil
 }
