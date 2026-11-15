@@ -18,110 +18,157 @@ package atproto
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/atcrypto"
+	"github.com/bluesky-social/indigo/atproto/auth"
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/openpubkey/openpubkey/jose"
+	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/stretchr/testify/require"
 )
 
-func TestDPoPProof(t *testing.T) {
+const (
+	testIssuer = "https://bsky.social"
+	testDID    = syntax.DID("did:plc:alice")
+)
+
+func newCIC(t *testing.T) (*ecdsa.PrivateKey, *clientinstance.Claims) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	op := &AtprotoOp{signer: key}
-
-	proof, err := op.dpopProof(http.MethodPost, "https://bsky.social/oauth/par", "nonce-value", "")
+	pub, err := jwk.PublicKeyOf(&key.PublicKey)
 	require.NoError(t, err)
-
-	_, err = jws.Verify([]byte(proof), jws.WithKey(jwa.ES256(), &key.PublicKey))
+	require.NoError(t, pub.Set(jwk.AlgorithmKey, jwa.ES256()))
+	cic, err := clientinstance.NewClaims(pub, map[string]any{})
 	require.NoError(t, err)
-
-	claims, err := DecodeJWTClaims([]byte(proof))
-	require.NoError(t, err)
-	require.Equal(t, "POST", claims["htm"])
-	require.Equal(t, "https://bsky.social/oauth/par", claims["htu"])
-	require.Equal(t, "nonce-value", claims["nonce"])
-	require.NotEmpty(t, claims["jti"])
+	return key, cic
 }
 
-func TestVerifyIDToken(t *testing.T) {
-	userKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func jkt(t *testing.T, pub crypto.PublicKey) string {
+	t.Helper()
+	key, err := jwk.PublicKeyOf(pub)
 	require.NoError(t, err)
-	asKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	thumbprint, err := key.Thumbprint(crypto.SHA256)
 	require.NoError(t, err)
+	return base64.RawURLEncoding.EncodeToString(thumbprint)
+}
 
-	asJWK, err := jwk.Import(&asKey.PublicKey)
-	require.NoError(t, err)
-	require.NoError(t, asJWK.Set(jwk.KeyIDKey, "as-key"))
-	require.NoError(t, asJWK.Set(jwk.AlgorithmKey, jwa.ES256()))
-	set := jwk.NewSet()
-	require.NoError(t, set.AddKey(asJWK))
-	jwks, err := json.Marshal(set)
-	require.NoError(t, err)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/xrpc/com.atproto.server.getSession" {
-			if r.Header.Get("DPoP") == "" || !strings.HasPrefix(r.Header.Get("Authorization"), "DPoP ") {
-				http.Error(w, `{"error":"AuthenticationRequired"}`, http.StatusUnauthorized)
-				return
-			}
-			_, _ = w.Write([]byte(`{"did":"did:plc:alice","handle":"alice.test"}`))
-			return
-		}
-		_, _ = w.Write(jwks)
-	}))
-	defer ts.Close()
+// The authorization server binds the access token to the JWK in indigo's DPoP
+// proofs; servers compare it against the CIC key. They must agree.
+func TestConfigKeyBindingKeepsSSHKey(t *testing.T) {
+	key, _ := newCIC(t)
+	var p Provider
+	require.NoError(t, p.ConfigKeyBinding(key, "ES256"))
 
-	op := &AtprotoOp{
-		issuer:  ts.URL,
-		jwksURI: ts.URL + "/jwks",
-		pdsURL:  ts.URL,
-		did:     "did:plc:alice",
-		signer:  userKey,
+	pub, err := p.key.PublicKey()
+	require.NoError(t, err)
+	dpopJWK, err := pub.JWK()
+	require.NoError(t, err)
+	raw, err := json.Marshal(dpopJWK)
+	require.NoError(t, err)
+	parsed, err := jwk.ParseKey(raw)
+	require.NoError(t, err)
+	require.Equal(t, jkt(t, &key.PublicKey), jkt(t, parsed))
+
+	require.Error(t, p.ConfigKeyBinding(key, "EdDSA"))
+}
+
+// NSID names cannot start with a digit, which a bare base32 hash sometimes does.
+func TestCommitmentIsValidNSID(t *testing.T) {
+	for range 200 {
+		_, cic := newCIC(t)
+		lxm, err := commitment(cic)
+		require.NoError(t, err)
+		again, err := commitment(cic)
+		require.NoError(t, err)
+		require.Equal(t, lxm, again)
 	}
-	userJWK, err := jwk.PublicKeyOf(&userKey.PublicKey)
-	require.NoError(t, err)
-	require.NoError(t, userJWK.Set(jwk.AlgorithmKey, jwa.ES256()))
-	cic, err := clientinstance.NewClaims(userJWK, map[string]any{})
-	require.NoError(t, err)
+}
 
-	asPrivateJWK, err := jwk.Import(asKey)
+func TestVerifier(t *testing.T) {
+	ctx := context.Background()
+	accountKey, err := atcrypto.GeneratePrivateKeyP256()
 	require.NoError(t, err)
-	issue := func(cnfJKT string) []byte {
+	accountPub, err := accountKey.PublicKey()
+	require.NoError(t, err)
+	dir := identity.NewMockDirectory()
+	dir.Insert(identity.Identity{
+		DID: testDID,
+		Keys: map[string]identity.VerificationMethod{
+			"atproto": {Type: "Multikey", PublicKeyMultibase: accountPub.Multibase()},
+		},
+	})
+	v := &Verifier{issuer: testIssuer, dir: dir}
+
+	sshKey, cic := newCIC(t)
+	_, otherCIC := newCIC(t)
+
+	accessToken := func(cnfKey crypto.PublicKey) []byte {
 		payload, err := json.Marshal(map[string]any{
-			"iss":   ts.URL,
-			"sub":   "did:plc:alice",
+			"iss":   testIssuer,
+			"sub":   testDID,
 			"aud":   "did:web:pds.example.com",
-			"scope": "atproto",
-			"iat":   time.Now().Unix(),
+			"scope": "atproto transition:generic",
 			"exp":   time.Now().Add(time.Hour).Unix(),
-			"cnf":   map[string]any{"jkt": cnfJKT},
+			"cnf":   map[string]string{"jkt": jkt(t, cnfKey)},
 		})
 		require.NoError(t, err)
-		headers := jws.NewHeaders()
-		require.NoError(t, headers.Set(jws.TypeKey, "at+jwt"))
-		require.NoError(t, headers.Set(jws.KeyIDKey, "as-key"))
-		token, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), asPrivateJWK, jws.WithProtectedHeaders(headers)))
+		token, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), sshKey)) // signature is not checked
 		require.NoError(t, err)
 		return token
 	}
+	serviceAuth := func(key atcrypto.PrivateKey, aud string, cic *clientinstance.Claims) []byte {
+		lxm, err := commitment(cic)
+		require.NoError(t, err)
+		token, err := auth.SignServiceAuth(testDID, aud, time.Hour, &lxm, key)
+		require.NoError(t, err)
+		return []byte(token)
+	}
+	pkToken := func(access, fresh []byte) *pktoken.PKToken {
+		cicToken, err := cic.Sign(sshKey, jose.ES256, access)
+		require.NoError(t, err)
+		pkt, err := pktoken.New(access, cicToken)
+		require.NoError(t, err)
+		pkt.FreshIDToken = fresh
+		return pkt
+	}
 
-	userJKT, err := jwkThumbprint(&userKey.PublicKey)
-	require.NoError(t, err)
-	require.NoError(t, op.VerifyIDToken(context.Background(), issue(userJKT), cic))
+	valid := accessToken(cic.PublicKey())
+	require.NoError(t, v.VerifyIDToken(ctx, valid, cic))
+	require.ErrorContains(t, v.VerifyIDToken(ctx, accessToken(otherCIC.PublicKey()), cic), "not bound to the SSH key")
 
-	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	wrongKey, err := atcrypto.GeneratePrivateKeyP256()
 	require.NoError(t, err)
-	otherJKT, err := jwkThumbprint(&otherKey.PublicKey)
-	require.NoError(t, err)
-	require.ErrorContains(t, op.VerifyIDToken(context.Background(), issue(otherJKT), cic), "cnf.jkt mismatch")
+	for name, tc := range map[string]struct {
+		fresh   []byte
+		wantErr string
+	}{
+		"valid":         {serviceAuth(accountKey, testDID.String(), cic), ""},
+		"missing":       {nil, "invalid service auth token"},
+		"other SSH key": {serviceAuth(accountKey, testDID.String(), otherCIC), "invalid service auth token"},
+		"wrong signer":  {serviceAuth(wrongKey, testDID.String(), cic), "invalid service auth token"},
+		"wrong aud":     {serviceAuth(accountKey, "did:web:example.com", cic), "invalid service auth token"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := v.VerifyServiceAuth(ctx, pkToken(valid, tc.fresh))
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
 }

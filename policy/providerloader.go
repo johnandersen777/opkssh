@@ -28,9 +28,14 @@ import (
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/providers"
 	"github.com/openpubkey/openpubkey/verifier"
+	"github.com/openpubkey/opkssh/atproto"
 	"github.com/openpubkey/opkssh/policy/files"
 	"github.com/spf13/afero"
 )
+
+// atprotoClientID marks a providers row as an atproto authorization server,
+// e.g. "https://bsky.social OPENPUBKEY-PKTOKEN:ATPROTO 24h".
+const atprotoClientID = "OPENPUBKEY-PKTOKEN:ATPROTO"
 
 type ProvidersRow struct {
 	Issuer           string
@@ -111,8 +116,8 @@ func providerVerifierFromRow(row ProvidersRow, cacheCfg discover.DiscoveryCacheC
 			audience:        row.ClientID,
 			publicKeyFinder: newCachedPublicKeyFinder(cacheCfg),
 		}
-	} else if row.ClientID == atprotoClientIDMarker {
-		return atprotoProviderVerifier{issuer: row.Issuer}
+	} else if row.ClientID == atprotoClientID {
+		return atproto.NewVerifier(row.Issuer)
 	} else if row.Issuer == "https://gitlab.com" {
 		opts := providers.GetDefaultGitlabOpOptions()
 		opts.Issuer = row.Issuer
@@ -130,21 +135,37 @@ func providerVerifierFromRow(row ProvidersRow, cacheCfg discover.DiscoveryCacheC
 	return providers.NewGoogleOpWithOptions(opts)
 }
 
-// PKTokenVerifier verifies a PK token. It is implemented by the generic
-// verifier and by policy wrappers that add provider-specific checks.
-type PKTokenVerifier interface {
-	VerifyPKToken(ctx context.Context, pkt *pktoken.PKToken, extraChecks ...verifier.Check) error
+// Verifier verifies PK tokens against the providers policy.
+type Verifier struct {
+	*verifier.Verifier
+	atproto map[string]*atproto.Verifier // by issuer
 }
 
-func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) (PKTokenVerifier, error) {
+// VerifyPKToken runs the OpenPubkey checks, plus the service auth check for
+// atproto PK tokens, which needs the whole PK token.
+func (v *Verifier) VerifyPKToken(ctx context.Context, pkt *pktoken.PKToken, extraChecks ...verifier.Check) error {
+	if err := v.Verifier.VerifyPKToken(ctx, pkt, extraChecks...); err != nil {
+		return err
+	}
+	issuer, err := pkt.Issuer()
+	if err != nil {
+		return err
+	}
+	if av, ok := v.atproto[issuer]; ok {
+		return av.VerifyServiceAuth(ctx, pkt)
+	}
+	return nil
+}
+
+func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) (*Verifier, error) {
 	pvs := []verifier.ProviderVerifier{}
-	atprotoIssuers := map[string]struct{}{}
+	atprotoVerifiers := map[string]*atproto.Verifier{}
 	var expirationPolicy verifier.ExpirationPolicy
 	var err error
 	for _, row := range p.rows {
 		provider := providerVerifierFromRow(row, cacheCfg)
-		if row.ClientID == atprotoClientIDMarker {
-			atprotoIssuers[row.Issuer] = struct{}{}
+		if av, ok := provider.(*atproto.Verifier); ok {
+			atprotoVerifiers[row.Issuer] = av
 		}
 
 		expirationPolicy, err = row.GetExpirationPolicy()
@@ -168,10 +189,7 @@ func (p *ProviderPolicy) CreateVerifier(cacheCfg discover.DiscoveryCacheConfig) 
 	if err != nil {
 		return nil, err
 	}
-	if len(atprotoIssuers) > 0 {
-		return &atprotoPolicyVerifier{Verifier: pktVerifier, atprotoIssuers: atprotoIssuers}, nil
-	}
-	return pktVerifier, nil
+	return &Verifier{Verifier: pktVerifier, atproto: atprotoVerifiers}, nil
 }
 
 type gitLabCiProviderVerifier struct {

@@ -33,9 +33,7 @@ type SshCertSmuggler struct {
 	SshCert *ssh.Certificate
 }
 
-// PKTokenVerifier verifies the PK token in an SSH certificate. It is an
-// interface so policy can wrap the generic verifier with provider-specific
-// checks that need the whole PK token.
+// PKTokenVerifier verifies the PK token in an SSH certificate.
 type PKTokenVerifier interface {
 	VerifyPKToken(ctx context.Context, pkt *pktoken.PKToken, extraChecks ...verifier.Check) error
 }

@@ -243,10 +243,13 @@ func NewProviderConfigFromString(configStr string, hasAlias bool) (ProviderConfi
 
 // NewProviderFromConfig is a function to create the provider from the config
 func (p *ProviderConfig) ToProvider(openBrowser bool) (providers.OpenIdProvider, error) {
-	// atproto://<handle> is not an OpenID issuer. The handle is resolved to the
-	// account DID, then to the account's PDS and OAuth authorization server.
+	// atproto://<handle> logs in with atproto OAuth rather than OpenID Connect.
 	if handle, ok := strings.CutPrefix(p.Issuer, "atproto://"); ok {
-		return atproto.NewAtprotoOp(handle, openBrowser)
+		op, err := atproto.New(handle, openBrowser)
+		if err != nil {
+			return nil, err
+		}
+		return op, nil
 	}
 
 	if p.Issuer == "" {

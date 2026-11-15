@@ -46,6 +46,7 @@ import (
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/providers"
 	"github.com/openpubkey/openpubkey/util"
+	"github.com/openpubkey/opkssh/atproto"
 	"github.com/openpubkey/opkssh/commands/config"
 	"github.com/openpubkey/opkssh/sshcert"
 	"github.com/spf13/afero"
@@ -574,13 +575,9 @@ func (l *LoginCmd) login(ctx context.Context, provider providers.OpenIdProvider,
 
 	l.pkt = pkt
 
-	// Some providers obtain a second, publicly verifiable proof during login
-	// (atproto's PDS-signed service auth token). Attach it before the PK token
-	// is serialized into the SSH certificate.
-	if attacher, ok := provider.(interface{ AttachServiceAuth(*pktoken.PKToken) error }); ok {
-		if err := attacher.AttachServiceAuth(pkt); err != nil {
-			return nil, err
-		}
+	// atproto PK tokens also carry a PDS-signed proof for SSH servers.
+	if op, ok := provider.(*atproto.Provider); ok {
+		op.AttachServiceAuth(pkt)
 	}
 
 	var accessToken []byte
