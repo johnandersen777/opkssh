@@ -49,6 +49,7 @@ import (
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/openpubkey/openpubkey/discover"
@@ -60,8 +61,8 @@ import (
 )
 
 const (
-	atprotoCallbackPath = "/callback"
-	atprotoFlowTimeout  = 5 * time.Minute
+	callbackPath = "/callback"
+	flowTimeout  = 5 * time.Minute
 )
 
 type AtprotoOp struct {
@@ -81,7 +82,7 @@ type AtprotoOp struct {
 
 	// signer is the SSH key, configured by ConfigKeyBinding. It also signs
 	// the DPoP proofs, binding the access token to the SSH key.
-	signer crypto.Signer
+	signer *ecdsa.PrivateKey
 	// serviceAuth is a PDS-signed service auth JWT whose lxm commits to the
 	// CIC. It is attached to the PK token for server-side verification.
 	serviceAuth []byte
@@ -90,7 +91,7 @@ type AtprotoOp struct {
 var _ providers.OpenIdProvider = (*AtprotoOp)(nil)
 var _ providers.KeyBindingOpenIdProvider = (*AtprotoOp)(nil)
 
-type atprotoServerMeta struct {
+type serverMeta struct {
 	Issuer                             string `json:"issuer"`
 	AuthorizationEndpoint              string `json:"authorization_endpoint"`
 	TokenEndpoint                      string `json:"token_endpoint"`
@@ -100,12 +101,18 @@ type atprotoServerMeta struct {
 
 // NewAtprotoOp resolves handle to its PDS and authorization server.
 func NewAtprotoOp(handle string, openBrowser bool) (*AtprotoOp, error) {
+	handle = strings.TrimSpace(handle)
+	if handle == "" {
+		handle = os.Getenv("ATPROTO_HANDLE")
+	}
 	o := &AtprotoOp{
-		handle:      strings.TrimSpace(handle),
+		handle:      handle,
 		openBrowser: openBrowser,
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
-	if err := o.discover(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := o.discover(ctx); err != nil {
 		return nil, err
 	}
 	o.finder = discover.PublicKeyFinder{
@@ -117,10 +124,6 @@ func NewAtprotoOp(handle string, openBrowser bool) (*AtprotoOp, error) {
 }
 
 func (o *AtprotoOp) discover(ctx context.Context) error {
-	if o.handle == "" {
-		o.handle = os.Getenv("ATPROTO_HANDLE")
-	}
-
 	// Resolve the handle through the atproto identity layer. indigo verifies
 	// the handle/DID mapping in both directions and extracts the PDS service
 	// from the DID document.
@@ -133,10 +136,10 @@ func (o *AtprotoOp) discover(ctx context.Context) error {
 	pdsURL := strings.TrimSuffix(ident.PDSEndpoint(), "/")
 	u, err := url.Parse(pdsURL)
 	if err != nil || u.Host == "" {
-		return fmt.Errorf("DID document for %s has no valid PDS endpoint (%q)", o.did, pdsURL)
+		return fmt.Errorf("did document for %s has no valid pds endpoint (%q)", o.did, pdsURL)
 	}
 	if u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1")) {
-		return fmt.Errorf("PDS endpoint must be https: %s", pdsURL)
+		return fmt.Errorf("pds endpoint must be https: %s", pdsURL)
 	}
 	o.pdsURL = pdsURL
 
@@ -157,12 +160,9 @@ func (o *AtprotoOp) discover(ctx context.Context) error {
 }
 
 func (o *AtprotoOp) resolveAuthorizationServer(ctx context.Context, pdsURL string) (string, error) {
-	body, status, err := o.get(ctx, pdsURL+"/.well-known/oauth-protected-resource")
+	body, err := o.get(ctx, pdsURL+"/.well-known/oauth-protected-resource")
 	if err != nil {
 		return "", err
-	}
-	if status != http.StatusOK {
-		return "", fmt.Errorf("protected resource metadata returned HTTP %d: %s", status, body)
 	}
 	var prm struct {
 		AuthorizationServers []string `json:"authorization_servers"`
@@ -181,33 +181,30 @@ func (o *AtprotoOp) resolveAuthorizationServer(ctx context.Context, pdsURL strin
 	return asURL, nil
 }
 
-func (o *AtprotoOp) fetchServerMeta(ctx context.Context, asURL string) (*atprotoServerMeta, error) {
-	body, status, err := o.get(ctx, asURL+"/.well-known/oauth-authorization-server")
+func (o *AtprotoOp) fetchServerMeta(ctx context.Context, asURL string) (*serverMeta, error) {
+	body, err := o.get(ctx, asURL+"/.well-known/oauth-authorization-server")
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("authorization server metadata returned HTTP %d: %s", status, body)
-	}
-	var meta atprotoServerMeta
+	var meta serverMeta
 	if err := json.Unmarshal(body, &meta); err != nil {
 		return nil, err
 	}
 	if strings.TrimSuffix(meta.Issuer, "/") != asURL {
 		return nil, fmt.Errorf("authorization server issuer %q does not match %q", meta.Issuer, asURL)
 	}
-	if meta.AuthorizationEndpoint == "" || meta.TokenEndpoint == "" || meta.PushedAuthorizationRequestEndpoint == "" || meta.JwksURI == "" {
-		return nil, fmt.Errorf("authorization server metadata is missing required endpoints")
-	}
-	for name, endpoint := range map[string]string{
-		"authorization_endpoint":                meta.AuthorizationEndpoint,
-		"token_endpoint":                        meta.TokenEndpoint,
-		"pushed_authorization_request_endpoint": meta.PushedAuthorizationRequestEndpoint,
-		"jwks_uri":                              meta.JwksURI,
+	for _, endpoint := range []struct {
+		name string
+		raw  string
+	}{
+		{"authorization_endpoint", meta.AuthorizationEndpoint},
+		{"token_endpoint", meta.TokenEndpoint},
+		{"pushed_authorization_request_endpoint", meta.PushedAuthorizationRequestEndpoint},
+		{"jwks_uri", meta.JwksURI},
 	} {
-		u, err := url.Parse(endpoint)
+		u, err := url.Parse(endpoint.raw)
 		if err != nil || u.Scheme != "https" || u.Host == "" {
-			return nil, fmt.Errorf("authorization server metadata has invalid %s %q", name, endpoint)
+			return nil, fmt.Errorf("authorization server metadata has invalid %s %q", endpoint.name, endpoint.raw)
 		}
 	}
 	return &meta, nil
@@ -223,15 +220,15 @@ func (o *AtprotoOp) ConfigKeyBinding(kbSigner crypto.Signer, kbAlg string) error
 	if !ok || key.Curve != elliptic.P256() {
 		return fmt.Errorf("atproto login requires a P-256 ECDSA key")
 	}
-	o.signer = kbSigner
+	o.signer = key
 	return nil
 }
 
 // RequestTokens runs atproto's PAR + PKCE + DPoP browser flow and returns the
 // access token JWT as the OP token.
 func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claims) (*simpleoidc.Tokens, error) {
-	key, ok := o.signer.(*ecdsa.PrivateKey)
-	if !ok || key.Curve != elliptic.P256() {
+	key := o.signer
+	if key == nil {
 		return nil, fmt.Errorf("atproto login requires a P-256 ECDSA key (use --key-type ecdsa)")
 	}
 
@@ -241,35 +238,48 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, atprotoCallbackPath)
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, callbackPath)
 	clientID := "http://localhost?redirect_uri=" + url.QueryEscape(redirectURI) + "&scope=" + Scopes
 
 	verifier := randB64(32)
 	challenge := sha256.Sum256([]byte(verifier))
 	state := randB64(16)
 
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
+	type callbackResult struct {
+		code string
+		err  error
+	}
+	resultCh := make(chan callbackResult, 1)
+	deliver := func(result callbackResult) {
+		select {
+		case resultCh <- result:
+		default:
+		}
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc(atprotoCallbackPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(callbackPath, func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if e := q.Get("error"); e != "" {
-			errCh <- fmt.Errorf("atproto authorization failed: %s: %s", e, q.Get("error_description"))
+			deliver(callbackResult{err: fmt.Errorf("atproto authorization failed: %s: %s", e, q.Get("error_description"))})
 			http.Error(w, "Login failed. You can close this window.", http.StatusBadRequest)
 			return
 		}
 		if q.Get("state") != state {
-			errCh <- fmt.Errorf("atproto authorization state mismatch")
+			deliver(callbackResult{err: fmt.Errorf("atproto authorization state mismatch")})
 			http.Error(w, "Login failed. You can close this window.", http.StatusBadRequest)
 			return
 		}
-		codeCh <- q.Get("code")
+		deliver(callbackResult{code: q.Get("code")})
 		fmt.Fprint(w, "Login complete. You can close this window.")
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
+	jkt, err := jwkThumbprint(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
 	form := url.Values{
 		"client_id":             {clientID},
 		"response_type":         {"code"},
@@ -279,7 +289,7 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 		"code_challenge":        {b64(challenge[:])},
 		"code_challenge_method": {"S256"},
 		"login_hint":            {o.handle},
-		"dpop_jkt":              {atprotoJKT(&key.PublicKey)},
+		"dpop_jkt":              {jkt},
 	}
 	var par struct {
 		RequestURI string `json:"request_uri"`
@@ -304,12 +314,14 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 
 	var code string
 	select {
-	case code = <-codeCh:
-	case err := <-errCh:
-		return nil, err
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, result.err
+		}
+		code = result.code
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(atprotoFlowTimeout):
+	case <-time.After(flowTimeout):
 		return nil, fmt.Errorf("timed out waiting for atproto authorization callback")
 	}
 
@@ -388,7 +400,7 @@ func (o *AtprotoOp) requestServiceAuth(ctx context.Context, accessToken string, 
 		return err
 	}
 	if out.Token == "" {
-		return fmt.Errorf("PDS returned an empty service auth token")
+		return fmt.Errorf("pds returned empty service auth token")
 	}
 	o.serviceAuth = []byte(out.Token)
 	return nil
@@ -423,11 +435,11 @@ func (o *AtprotoOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientin
 	if err != nil {
 		return err
 	}
-	if hasJWKSKeys(jwks) {
-		set, err := jwk.Parse(jwks)
-		if err != nil {
-			return fmt.Errorf("failed to parse atproto JWKS: %w", err)
-		}
+	set, err := jwk.Parse(jwks)
+	if err != nil {
+		return fmt.Errorf("failed to parse atproto JWKS: %w", err)
+	}
+	if set.Len() > 0 {
 		if _, err := jws.Verify(idt, jws.WithKeySet(set, jws.WithRequireKid(false))); err != nil {
 			return fmt.Errorf("atproto access token signature verification failed: %w", err)
 		}
@@ -457,7 +469,7 @@ func (o *AtprotoOp) checkSession(ctx context.Context, accessToken []byte) error 
 		return err
 	}
 	if session.DID != o.did {
-		return fmt.Errorf("PDS session is for %s, expected %s", session.DID, o.did)
+		return fmt.Errorf("pds session is for %s, expected %s", session.DID, o.did)
 	}
 	return nil
 }
@@ -480,14 +492,7 @@ func (o *AtprotoOp) pdsGet(ctx context.Context, endpoint string, query url.Value
 }
 
 func (o *AtprotoOp) fetchJWKS(ctx context.Context) ([]byte, error) {
-	body, status, err := o.get(ctx, o.jwksURI)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("atproto JWKS returned HTTP %d", status)
-	}
-	return body, nil
+	return o.get(ctx, o.jwksURI)
 }
 
 // postForm posts form and decodes the JSON response.
@@ -518,7 +523,7 @@ func oauthError(status int, body []byte) error {
 	return fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(string(body)))
 }
 
-func (o *AtprotoOp) httpClientOrDefault() *http.Client {
+func (o *AtprotoOp) client() *http.Client {
 	if o.httpClient == nil {
 		return http.DefaultClient
 	}
@@ -561,7 +566,7 @@ func (o *AtprotoOp) do(ctx context.Context, method, endpoint string, form url.Va
 			req.Header.Set("DPoP-Nonce", nonce)
 		}
 	}
-	resp, err := o.httpClientOrDefault().Do(req)
+	resp, err := o.client().Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -591,18 +596,24 @@ func (o *AtprotoOp) requestWithNonce(ctx context.Context, method, endpoint strin
 		}
 		return status, header, body, nil
 	}
-	return 0, nil, nil, fmt.Errorf("DPoP nonce retry failed")
+	return 0, nil, nil, fmt.Errorf("dpop nonce retry failed")
 }
 
-func (o *AtprotoOp) get(ctx context.Context, endpoint string) ([]byte, int, error) {
+func (o *AtprotoOp) get(ctx context.Context, endpoint string) ([]byte, error) {
 	status, _, body, err := o.do(ctx, http.MethodGet, endpoint, nil, "", "")
-	return body, status, err
+	if err != nil {
+		return nil, err
+	}
+	if status/100 != 2 {
+		return nil, fmt.Errorf("%s: %w", endpoint, oauthError(status, body))
+	}
+	return body, nil
 }
 
-func (o *AtprotoOp) dpopProof(method, endpoint, nonce string, accessToken ...string) (string, error) {
-	key, ok := o.signer.(*ecdsa.PrivateKey)
-	if !ok || key.Curve != elliptic.P256() {
-		return "", fmt.Errorf("atproto DPoP requires a P-256 ECDSA key")
+func (o *AtprotoOp) dpopProof(method, endpoint, nonce, accessToken string) (string, error) {
+	key := o.signer
+	if key == nil {
+		return "", fmt.Errorf("atproto DPoP signer is not configured")
 	}
 	claims := map[string]any{
 		"jti": randB64(16),
@@ -615,60 +626,47 @@ func (o *AtprotoOp) dpopProof(method, endpoint, nonce string, accessToken ...str
 	}
 	// Resource-server requests must carry ath, the hash of the access token
 	// (RFC 9449 section 4.2).
-	if len(accessToken) > 0 && accessToken[0] != "" {
-		sum := sha256.Sum256([]byte(accessToken[0]))
+	if accessToken != "" {
+		sum := sha256.Sum256([]byte(accessToken))
 		claims["ath"] = b64(sum[:])
 	}
-	header := map[string]any{
-		"typ": "dpop+jwt",
-		"alg": "ES256",
-		"jwk": atprotoJWK(&key.PublicKey),
-	}
-	return signES256(key, header, claims)
-}
-
-func atprotoJWK(pub *ecdsa.PublicKey) map[string]string {
-	x, y := ecCoords(pub)
-	return map[string]string{"kty": "EC", "crv": "P-256", "x": x, "y": y}
-}
-
-// atprotoJKT is the RFC 7638 thumbprint used as the DPoP key binding.
-func atprotoJKT(pub *ecdsa.PublicKey) string {
-	x, y := ecCoords(pub)
-	canonical := fmt.Sprintf(`{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}`, x, y)
-	sum := sha256.Sum256([]byte(canonical))
-	return b64(sum[:])
-}
-
-// ecCoords returns the base64url P-256 coordinates from the uncompressed
-// SEC1 public key encoding (0x04 || X || Y).
-func ecCoords(pub *ecdsa.PublicKey) (string, string) {
-	raw, err := pub.Bytes()
-	if err != nil || len(raw) != 65 || raw[0] != 4 {
-		panic("atproto: not an uncompressed P-256 public key")
-	}
-	return b64(raw[1:33]), b64(raw[33:65])
-}
-
-func signES256(key *ecdsa.PrivateKey, header, claims any) (string, error) {
-	headerJSON, err := json.Marshal(header)
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err
 	}
-	claimsJSON, err := json.Marshal(claims)
+	privateKey, err := jwk.Import(key)
 	if err != nil {
 		return "", err
 	}
-	input := b64(headerJSON) + "." + b64(claimsJSON)
-	digest := sha256.Sum256([]byte(input))
-	r, s, err := ecdsa.Sign(rand.Reader, key, digest[:])
+	publicKey, err := jwk.PublicKeyOf(&key.PublicKey)
 	if err != nil {
 		return "", err
 	}
-	sig := make([]byte, 64)
-	r.FillBytes(sig[:32])
-	s.FillBytes(sig[32:])
-	return input + "." + b64(sig), nil
+	headers := jws.NewHeaders()
+	if err := headers.Set(jws.TypeKey, "dpop+jwt"); err != nil {
+		return "", err
+	}
+	if err := headers.Set(jws.JWKKey, publicKey); err != nil {
+		return "", err
+	}
+	proof, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), privateKey, jws.WithProtectedHeaders(headers)))
+	if err != nil {
+		return "", err
+	}
+	return string(proof), nil
+}
+
+// jwkThumbprint is the RFC 7638 thumbprint used as the DPoP key binding.
+func jwkThumbprint(pub *ecdsa.PublicKey) (string, error) {
+	key, err := jwk.PublicKeyOf(pub)
+	if err != nil {
+		return "", err
+	}
+	thumbprint, err := key.Thumbprint(crypto.SHA256)
+	if err != nil {
+		return "", err
+	}
+	return b64(thumbprint), nil
 }
 
 func randB64(n int) string {

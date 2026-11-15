@@ -40,7 +40,7 @@ func TestDPoPProof(t *testing.T) {
 	require.NoError(t, err)
 	op := &AtprotoOp{signer: key}
 
-	proof, err := op.dpopProof(http.MethodPost, "https://bsky.social/oauth/par", "nonce-value")
+	proof, err := op.dpopProof(http.MethodPost, "https://bsky.social/oauth/par", "nonce-value", "")
 	require.NoError(t, err)
 
 	_, err = jws.Verify([]byte(proof), jws.WithKey(jwa.ES256(), &key.PublicKey))
@@ -60,10 +60,13 @@ func TestVerifyIDToken(t *testing.T) {
 	asKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
-	x, y := ecCoords(&asKey.PublicKey)
-	jwks, err := json.Marshal(map[string]any{"keys": []any{map[string]any{
-		"kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": "as-key", "alg": "ES256", "use": "sig",
-	}}})
+	asJWK, err := jwk.Import(&asKey.PublicKey)
+	require.NoError(t, err)
+	require.NoError(t, asJWK.Set(jwk.KeyIDKey, "as-key"))
+	require.NoError(t, asJWK.Set(jwk.AlgorithmKey, jwa.ES256()))
+	set := jwk.NewSet()
+	require.NoError(t, set.AddKey(asJWK))
+	jwks, err := json.Marshal(set)
 	require.NoError(t, err)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/xrpc/com.atproto.server.getSession" {
@@ -91,8 +94,10 @@ func TestVerifyIDToken(t *testing.T) {
 	cic, err := clientinstance.NewClaims(userJWK, map[string]any{})
 	require.NoError(t, err)
 
+	asPrivateJWK, err := jwk.Import(asKey)
+	require.NoError(t, err)
 	issue := func(cnfJKT string) []byte {
-		token, err := signES256(asKey, map[string]any{"alg": "ES256", "kid": "as-key", "typ": "at+jwt"}, map[string]any{
+		payload, err := json.Marshal(map[string]any{
 			"iss":   ts.URL,
 			"sub":   "did:plc:alice",
 			"aud":   "did:web:pds.example.com",
@@ -102,12 +107,21 @@ func TestVerifyIDToken(t *testing.T) {
 			"cnf":   map[string]any{"jkt": cnfJKT},
 		})
 		require.NoError(t, err)
-		return []byte(token)
+		headers := jws.NewHeaders()
+		require.NoError(t, headers.Set(jws.TypeKey, "at+jwt"))
+		require.NoError(t, headers.Set(jws.KeyIDKey, "as-key"))
+		token, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), asPrivateJWK, jws.WithProtectedHeaders(headers)))
+		require.NoError(t, err)
+		return token
 	}
 
-	require.NoError(t, op.VerifyIDToken(context.Background(), issue(atprotoJKT(&userKey.PublicKey)), cic))
+	userJKT, err := jwkThumbprint(&userKey.PublicKey)
+	require.NoError(t, err)
+	require.NoError(t, op.VerifyIDToken(context.Background(), issue(userJKT), cic))
 
 	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	require.ErrorContains(t, op.VerifyIDToken(context.Background(), issue(atprotoJKT(&otherKey.PublicKey)), cic), "cnf.jkt mismatch")
+	otherJKT, err := jwkThumbprint(&otherKey.PublicKey)
+	require.NoError(t, err)
+	require.ErrorContains(t, op.VerifyIDToken(context.Background(), issue(otherJKT), cic), "cnf.jkt mismatch")
 }

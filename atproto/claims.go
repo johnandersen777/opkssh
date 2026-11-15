@@ -125,11 +125,3 @@ func ParseCommitmentNSID(lxm string) ([]byte, error) {
 	}
 	return commitment, nil
 }
-
-// hasJWKSKeys reports whether a JWKS document advertises any keys.
-func hasJWKSKeys(jwks []byte) bool {
-	var out struct {
-		Keys []json.RawMessage `json:"keys"`
-	}
-	return json.Unmarshal(jwks, &out) == nil && len(out.Keys) > 0
-}
