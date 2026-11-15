@@ -22,7 +22,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -38,6 +37,7 @@ import (
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/verifier"
+	"github.com/openpubkey/opkssh/atproto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,11 +115,9 @@ func TestAtprotoPolicyVerifier(t *testing.T) {
 	pkt, err := pktoken.New(accessToken, cicToken)
 	require.NoError(t, err)
 
-	cicHash, err := cic.Hash()
+	cicDigest, err := atproto.CICDigest(cic)
 	require.NoError(t, err)
-	cicDigest, err := base64.RawURLEncoding.DecodeString(string(cicHash))
-	require.NoError(t, err)
-	lxm := atprotoCommitmentPrefix + lowerBase32(cicDigest)
+	lxm := atproto.CommitmentNSID(cicDigest)
 
 	serviceClaims := map[string]any{
 		"iss": did,
@@ -155,7 +153,7 @@ func TestAtprotoPolicyVerifier(t *testing.T) {
 	for k, val := range serviceClaims {
 		bad[k] = val
 	}
-	bad["lxm"] = atprotoCommitmentPrefix + lowerBase32(wrongDigest)
+	bad["lxm"] = atproto.CommitmentNSID(wrongDigest)
 	pkt.FreshIDToken = signServiceJWT(t, acctKey, bad)
 	require.ErrorContains(t, v.VerifyPKToken(ctx, pkt), "does not commit")
 
@@ -167,8 +165,4 @@ func TestAtprotoPolicyVerifier(t *testing.T) {
 	sig[0] ^= 0xff
 	pkt.FreshIDToken = []byte(parts[0] + "." + parts[1] + "." + b64URL(sig))
 	require.Error(t, v.VerifyPKToken(ctx, pkt))
-}
-
-func lowerBase32(b []byte) string {
-	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
 }

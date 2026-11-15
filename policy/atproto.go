@@ -34,8 +34,6 @@ package policy
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"encoding/base32"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -43,16 +41,15 @@ import (
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/verifier"
+	"github.com/openpubkey/opkssh/atproto"
 )
 
 const (
-	atprotoClientIDMarker   = "OPENPUBKEY-PKTOKEN:ATPROTO"
-	atprotoCommitmentPrefix = "com.opkssh."
-	atprotoFreshTokenMaxAge = time.Hour + time.Minute
+	atprotoClientIDMarker = "OPENPUBKEY-PKTOKEN:ATPROTO"
+	atprotoMaxClockSkew   = time.Minute
 )
 
 // atprotoDirectory is a variable so tests can point DID resolution at a test
@@ -70,44 +67,11 @@ type atprotoProviderVerifier struct {
 func (v atprotoProviderVerifier) Issuer() string { return v.issuer }
 
 func (v atprotoProviderVerifier) VerifyIDToken(_ context.Context, idt []byte, cic *clientinstance.Claims) error {
-	claims, err := decodeJwtPayload(idt)
+	claims, err := atproto.DecodeJWTClaims(idt)
 	if err != nil {
 		return err
 	}
-	if iss, _ := claims["iss"].(string); iss != v.issuer {
-		return fmt.Errorf("atproto access token issuer %q does not match %q", iss, v.issuer)
-	}
-	if exp, ok := claims["exp"].(float64); !ok || time.Now().After(time.Unix(int64(exp), 0)) {
-		return fmt.Errorf("atproto access token is expired or has no exp claim")
-	}
-	if sub, _ := claims["sub"].(string); sub == "" {
-		return fmt.Errorf("atproto access token has no sub claim")
-	} else if _, err := syntax.ParseDID(sub); err != nil {
-		return fmt.Errorf("atproto access token sub is not a DID: %w", err)
-	}
-	if aud, _ := claims["aud"].(string); !strings.HasPrefix(aud, "did:") {
-		return fmt.Errorf("atproto access token aud is not a DID")
-	}
-	if scope, _ := claims["scope"].(string); !strings.Contains(scope, "atproto") {
-		return fmt.Errorf("atproto access token is missing the atproto scope")
-	}
-	cnf, _ := claims["cnf"].(map[string]any)
-	jkt, _ := cnf["jkt"].(string)
-	if jkt == "" {
-		return fmt.Errorf("atproto access token has no cnf.jkt claim")
-	}
-	cicJWK, err := jwk.PublicKeyOf(cic.PublicKey())
-	if err != nil {
-		return err
-	}
-	thumbprint, err := cicJWK.Thumbprint(crypto.SHA256)
-	if err != nil {
-		return err
-	}
-	if base64.RawURLEncoding.EncodeToString(thumbprint) != jkt {
-		return fmt.Errorf("atproto access token is not bound to the SSH key (cnf.jkt mismatch)")
-	}
-	return nil
+	return atproto.VerifyAccessTokenClaims(claims, cic, v.issuer)
 }
 
 // atprotoPolicyVerifier adds the atproto service-auth check on top of the
@@ -142,7 +106,7 @@ func verifyAtprotoFreshToken(ctx context.Context, pkt *pktoken.PKToken) error {
 	if len(parts) != 3 {
 		return fmt.Errorf("atproto service auth token is not a JWT")
 	}
-	claims, err := decodeJwtPayload(pkt.FreshIDToken)
+	claims, err := atproto.DecodeJWTClaims(pkt.FreshIDToken)
 	if err != nil {
 		return err
 	}
@@ -152,7 +116,7 @@ func verifyAtprotoFreshToken(ctx context.Context, pkt *pktoken.PKToken) error {
 	if err != nil {
 		return fmt.Errorf("atproto service auth issuer is not a DID: %w", err)
 	}
-	accessClaims, err := decodeJwtPayload(pkt.OpToken)
+	accessClaims, err := atproto.DecodeJWTClaims(pkt.OpToken)
 	if err != nil {
 		return err
 	}
@@ -164,28 +128,20 @@ func verifyAtprotoFreshToken(ctx context.Context, pkt *pktoken.PKToken) error {
 	if !ok || time.Now().After(time.Unix(int64(exp), 0)) {
 		return fmt.Errorf("atproto service auth token is expired or has no exp claim")
 	}
-	if iat, ok := claims["iat"].(float64); ok && time.Unix(int64(iat), 0).After(time.Now().Add(atprotoFreshTokenMaxAge)) {
+	if iat, ok := claims["iat"].(float64); ok && time.Unix(int64(iat), 0).After(time.Now().Add(atprotoMaxClockSkew)) {
 		return fmt.Errorf("atproto service auth token is issued too far in the future")
 	}
 
 	lxm, _ := claims["lxm"].(string)
-	encoded, found := strings.CutPrefix(lxm, atprotoCommitmentPrefix)
-	if !found {
-		return fmt.Errorf("atproto service auth token lxm does not carry a commitment")
-	}
-	commitment, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(encoded))
+	commitment, err := atproto.ParseCommitmentNSID(lxm)
 	if err != nil {
-		return fmt.Errorf("atproto service auth lxm commitment is malformed: %w", err)
+		return err
 	}
 	cic, err := pkt.GetCicValues()
 	if err != nil {
 		return err
 	}
-	cicHash, err := cic.Hash()
-	if err != nil {
-		return err
-	}
-	cicDigest, err := base64.RawURLEncoding.DecodeString(string(cicHash))
+	cicDigest, err := atproto.CICDigest(cic)
 	if err != nil {
 		return err
 	}

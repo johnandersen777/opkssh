@@ -46,7 +46,7 @@ func TestDPoPProof(t *testing.T) {
 	_, err = jws.Verify([]byte(proof), jws.WithKey(jwa.ES256(), &key.PublicKey))
 	require.NoError(t, err)
 
-	claims, err := jwtClaims([]byte(proof))
+	claims, err := DecodeJWTClaims([]byte(proof))
 	require.NoError(t, err)
 	require.Equal(t, "POST", claims["htm"])
 	require.Equal(t, "https://bsky.social/oauth/par", claims["htu"])

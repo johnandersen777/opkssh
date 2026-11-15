@@ -25,9 +25,8 @@ package atproto
 // the handle through the atproto identity layer: handle -> DID -> DID document
 // -> PDS -> authorization server.
 //
-// ponytail: opkssh servers only know OIDC issuers, so a verifier for the
-// atproto authorization server (JWKS at jwks_uri, cnf.jkt commitment) is
-// needed before stock servers accept these certs.
+// Servers verify the access token's cnf binding plus a PDS service auth JWT
+// carried in the PK token's FreshIDToken field.
 
 import (
 	"context"
@@ -36,7 +35,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -62,14 +60,8 @@ import (
 )
 
 const (
-	atprotoRequiredScope = "atproto"
-	// transition:generic is needed to request a service auth token with a
-	// custom lxm (the commitment to the SSH key).
-	atprotoScope        = "atproto transition:generic"
 	atprotoCallbackPath = "/callback"
 	atprotoFlowTimeout  = 5 * time.Minute
-	// atprotoCommitmentPrefix is the NSID prefix carrying the CIC commitment.
-	atprotoCommitmentPrefix = "com.opkssh."
 )
 
 type AtprotoOp struct {
@@ -250,7 +242,7 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, atprotoCallbackPath)
-	clientID := "http://localhost?redirect_uri=" + url.QueryEscape(redirectURI) + "&scope=" + atprotoScope
+	clientID := "http://localhost?redirect_uri=" + url.QueryEscape(redirectURI) + "&scope=" + Scopes
 
 	verifier := randB64(32)
 	challenge := sha256.Sum256([]byte(verifier))
@@ -282,7 +274,7 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 		"client_id":             {clientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {redirectURI},
-		"scope":                 {atprotoScope},
+		"scope":                 {Scopes},
 		"state":                 {state},
 		"code_challenge":        {b64(challenge[:])},
 		"code_challenge_method": {"S256"},
@@ -292,8 +284,7 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 	var par struct {
 		RequestURI string `json:"request_uri"`
 	}
-	nonce, err := o.postForm(ctx, o.parURL, form, &par)
-	if err != nil {
+	if err := o.postForm(ctx, o.parURL, form, &par); err != nil {
 		return nil, fmt.Errorf("atproto PAR request failed: %w", err)
 	}
 
@@ -329,14 +320,13 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 		Scope        string `json:"scope"`
 		Sub          string `json:"sub"`
 	}
-	_, err = o.postForm(ctx, o.tokenURL, url.Values{
+	if err := o.postForm(ctx, o.tokenURL, url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"redirect_uri":  {redirectURI},
 		"client_id":     {clientID},
 		"code_verifier": {verifier},
-	}, &tok, nonce)
-	if err != nil {
+	}, &tok); err != nil {
 		return nil, fmt.Errorf("atproto token request failed: %w", err)
 	}
 	if tok.AccessToken == "" {
@@ -345,8 +335,8 @@ func (o *AtprotoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 	if tok.Sub != "" && tok.Sub != o.did {
 		return nil, fmt.Errorf("atproto token is for %s, expected %s", tok.Sub, o.did)
 	}
-	if !strings.Contains(tok.Scope, atprotoRequiredScope) {
-		return nil, fmt.Errorf("atproto token is missing the %s scope", atprotoRequiredScope)
+	if !strings.Contains(tok.Scope, RequiredScope) {
+		return nil, fmt.Errorf("atproto token is missing the %s scope", RequiredScope)
 	}
 
 	// A service auth token is signed by the account's repo signing key, which
@@ -377,22 +367,14 @@ func (o *AtprotoOp) AttachServiceAuth(pkt *pktoken.PKToken) error {
 // the CIC. The token is signed by the account's repo signing key, so it can be
 // verified offline against the account's DID document.
 func (o *AtprotoOp) requestServiceAuth(ctx context.Context, accessToken string, cic *clientinstance.Claims) error {
-	hash, err := cic.Hash()
+	digest, err := CICDigest(cic)
 	if err != nil {
 		return err
 	}
-	// cic.Hash() is base64url text; use the raw digest so the NSID name
-	// segment stays under its 63-character limit.
-	digest, err := base64.RawURLEncoding.DecodeString(string(hash))
-	if err != nil {
-		return err
-	}
-	lxm := atprotoCommitmentPrefix + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(digest))
-
 	endpoint := o.pdsURL + "/xrpc/com.atproto.server.getServiceAuth"
 	query := url.Values{
 		"aud": {o.did},
-		"lxm": {lxm},
+		"lxm": {CommitmentNSID(digest)},
 		"exp": {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
 	}
 	body, err := o.pdsGet(ctx, endpoint, query, accessToken)
@@ -422,14 +404,19 @@ func (o *AtprotoOp) PublicKeyByToken(ctx context.Context, token []byte) (*discov
 
 // VerifyIDToken verifies the atproto access token's issuer, expiry, subject,
 // and cnf.jkt key binding. Signature verification is best-effort: some
-// authorization servers sign access tokens with a symmetric HMAC key and
-// publish an empty JWKS, making them opaque to clients. In that case the token
-// is trusted because it was read directly from the token endpoint response
-// over TLS, and its cnf claim still proves possession of the SSH key.
+// authorization servers sign access tokens with a key they do not publish,
+// making them opaque to clients. The PDS session check below is the real proof
+// for those tokens.
 func (o *AtprotoOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientinstance.Claims) error {
-	alg, err := jwtHeaderAlg(idt)
+	claims, err := DecodeJWTClaims(idt)
 	if err != nil {
 		return err
+	}
+	if err := VerifyAccessTokenClaims(claims, cic, o.issuer); err != nil {
+		return err
+	}
+	if sub, _ := claims["sub"].(string); sub != o.did {
+		return fmt.Errorf("atproto access token subject %q does not match %q", sub, o.did)
 	}
 
 	jwks, err := o.fetchJWKS(ctx)
@@ -444,52 +431,9 @@ func (o *AtprotoOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientin
 		if _, err := jws.Verify(idt, jws.WithKeySet(set, jws.WithRequireKid(false))); err != nil {
 			return fmt.Errorf("atproto access token signature verification failed: %w", err)
 		}
-	} else if !strings.HasPrefix(alg, "HS") && alg != "ES256K" {
-		// ES256K is what atproto entryways use; HS* tokens are also opaque to
-		// clients by design. checkSession below is the real proof for both.
-		return fmt.Errorf("atproto JWKS is empty and cannot verify %s access token", alg)
 	}
 
-	claims, err := jwtClaims(idt)
-	if err != nil {
-		return err
-	}
-	if iss, _ := claims["iss"].(string); iss != o.issuer {
-		return fmt.Errorf("atproto access token issuer %q does not match %q", iss, o.issuer)
-	}
-	if exp, ok := claims["exp"].(float64); !ok || time.Now().After(time.Unix(int64(exp), 0)) {
-		return fmt.Errorf("atproto access token is expired or has no exp claim")
-	}
-	if sub, _ := claims["sub"].(string); sub != o.did {
-		return fmt.Errorf("atproto access token subject %q does not match %q", sub, o.did)
-	}
-	if aud, _ := claims["aud"].(string); aud == "" {
-		return fmt.Errorf("atproto access token has no aud claim")
-	}
-	if scope, _ := claims["scope"].(string); !strings.Contains(scope, atprotoRequiredScope) {
-		return fmt.Errorf("atproto access token is missing the %s scope", atprotoRequiredScope)
-	}
-
-	cnf, _ := claims["cnf"].(map[string]any)
-	jkt, _ := cnf["jkt"].(string)
-	if jkt == "" {
-		return fmt.Errorf("atproto access token has no cnf.jkt claim")
-	}
-	cicJWK, err := jwk.PublicKeyOf(cic.PublicKey())
-	if err != nil {
-		return err
-	}
-	thumbprint, err := cicJWK.Thumbprint(crypto.SHA256)
-	if err != nil {
-		return err
-	}
-	if b64(thumbprint) != jkt {
-		return fmt.Errorf("atproto access token is not bound to the SSH key (cnf.jkt mismatch)")
-	}
-
-	// Authorization servers may sign access tokens with a key they do not
-	// publish (e.g. an entryway ES256K key), so the token is opaque to the
-	// client. Prove it is valid and bound to the SSH key by calling the PDS
+	// Prove the token is valid and bound to the SSH key by calling the PDS
 	// with a DPoP proof: only the holder of the key in cnf.jkt can do that.
 	if err := o.checkSession(ctx, idt); err != nil {
 		return fmt.Errorf("atproto session check failed: %w", err)
@@ -525,43 +469,14 @@ func (o *AtprotoOp) pdsGet(ctx context.Context, endpoint string, query url.Value
 	if len(query) > 0 {
 		fullURL += "?" + query.Encode()
 	}
-	nonce := ""
-	for attempt := 0; attempt < 2; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		// cnf-bound access tokens must use the DPoP authorization scheme
-		// (RFC 9449 section 7.1), not Bearer.
-		req.Header.Set("Authorization", "DPoP "+accessToken)
-		// htu excludes the query string; ath hashes the access token.
-		proof, err := o.dpopProof(http.MethodGet, endpoint, nonce, accessToken)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("DPoP", proof)
-		if nonce != "" {
-			req.Header.Set("DPoP-Nonce", nonce)
-		}
-		resp, err := o.httpClientOrDefault().Do(req)
-		if err != nil {
-			return nil, err
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode/100 == 2 {
-			return body, nil
-		}
-		if newNonce := resp.Header.Get("DPoP-Nonce"); newNonce != "" && attempt == 0 {
-			nonce = newNonce
-			continue
-		}
-		return nil, oauthError(resp.StatusCode, body)
+	status, _, body, err := o.requestWithNonce(ctx, http.MethodGet, fullURL, nil, accessToken)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("PDS rejected the DPoP proof")
+	if status/100 != 2 {
+		return nil, oauthError(status, body)
+	}
+	return body, nil
 }
 
 func (o *AtprotoOp) fetchJWKS(ctx context.Context) ([]byte, error) {
@@ -575,34 +490,16 @@ func (o *AtprotoOp) fetchJWKS(ctx context.Context) ([]byte, error) {
 	return body, nil
 }
 
-// postForm posts form and decodes the JSON response, retrying once with the
-// server's DPoP nonce when the server answers use_dpop_nonce.
-func (o *AtprotoOp) postForm(ctx context.Context, endpoint string, form url.Values, out any, nonces ...string) (string, error) {
-	nonce := ""
-	if len(nonces) > 0 {
-		nonce = nonces[0]
+// postForm posts form and decodes the JSON response.
+func (o *AtprotoOp) postForm(ctx context.Context, endpoint string, form url.Values, out any) error {
+	status, _, body, err := o.requestWithNonce(ctx, http.MethodPost, endpoint, form, "")
+	if err != nil {
+		return err
 	}
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		resp, body, err := o.do(ctx, http.MethodPost, endpoint, form, nonce)
-		if err != nil {
-			return "", err
-		}
-		if resp.Header.Get("DPoP-Nonce") != "" {
-			nonce = resp.Header.Get("DPoP-Nonce")
-		}
-		if resp.StatusCode/100 == 2 {
-			if err := json.Unmarshal(body, out); err != nil {
-				return "", err
-			}
-			return nonce, nil
-		}
-		lastErr = oauthError(resp.StatusCode, body)
-		if !strings.Contains(lastErr.Error(), "use_dpop_nonce") {
-			break
-		}
+	if status/100 != 2 {
+		return oauthError(status, body)
 	}
-	return "", lastErr
+	return json.Unmarshal(body, out)
 }
 
 func oauthError(status int, body []byte) error {
@@ -628,53 +525,78 @@ func (o *AtprotoOp) httpClientOrDefault() *http.Client {
 	return o.httpClient
 }
 
-func (o *AtprotoOp) do(ctx context.Context, method, endpoint string, form url.Values, nonce string) (*http.Response, []byte, error) {
+// do sends one request. form means a form-encoded POST. accessToken adds the
+// DPoP authorization scheme and ath claim. A DPoP proof is added once the
+// login signer is configured.
+func (o *AtprotoOp) do(ctx context.Context, method, endpoint string, form url.Values, accessToken, nonce string) (int, http.Header, []byte, error) {
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, nil, err
 	}
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
-	proof, err := o.dpopProof(method, endpoint, nonce)
-	if err != nil {
-		return nil, nil, err
+	if accessToken != "" {
+		// cnf-bound access tokens must use the DPoP authorization scheme
+		// (RFC 9449 section 7.1), not Bearer.
+		req.Header.Set("Authorization", "DPoP "+accessToken)
 	}
-	req.Header.Set("DPoP", proof)
-	if nonce != "" {
-		req.Header.Set("DPoP-Nonce", nonce)
+	if o.signer != nil {
+		// htu excludes query and fragment (RFC 9449 section 4.3).
+		htu := endpoint
+		if u, err := url.Parse(endpoint); err == nil {
+			u.RawQuery, u.Fragment = "", ""
+			htu = u.String()
+		}
+		proof, err := o.dpopProof(method, htu, nonce, accessToken)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		req.Header.Set("DPoP", proof)
+		if nonce != "" {
+			req.Header.Set("DPoP-Nonce", nonce)
+		}
 	}
 	resp, err := o.httpClientOrDefault().Do(req)
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, nil, err
+		return resp.StatusCode, resp.Header, nil, err
 	}
-	return resp, respBody, nil
+	return resp.StatusCode, resp.Header, respBody, nil
+}
+
+// requestWithNonce retries once with the server's DPoP nonce. atproto servers
+// require a server-issued nonce in the DPoP proof.
+func (o *AtprotoOp) requestWithNonce(ctx context.Context, method, endpoint string, form url.Values, accessToken string) (int, http.Header, []byte, error) {
+	nonce := ""
+	for attempt := 0; attempt < 2; attempt++ {
+		status, header, body, err := o.do(ctx, method, endpoint, form, accessToken, nonce)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		if status/100 == 2 {
+			return status, header, body, nil
+		}
+		if newNonce := header.Get("DPoP-Nonce"); newNonce != "" && attempt == 0 {
+			nonce = newNonce
+			continue
+		}
+		return status, header, body, nil
+	}
+	return 0, nil, nil, fmt.Errorf("DPoP nonce retry failed")
 }
 
 func (o *AtprotoOp) get(ctx context.Context, endpoint string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	resp, err := o.httpClientOrDefault().Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return body, resp.StatusCode, nil
+	status, _, body, err := o.do(ctx, http.MethodGet, endpoint, nil, "", "")
+	return body, status, err
 }
 
 func (o *AtprotoOp) dpopProof(method, endpoint, nonce string, accessToken ...string) (string, error) {
@@ -747,47 +669,6 @@ func signES256(key *ecdsa.PrivateKey, header, claims any) (string, error) {
 	r.FillBytes(sig[:32])
 	s.FillBytes(sig[32:])
 	return input + "." + b64(sig), nil
-}
-
-func jwtClaims(token []byte) (map[string]any, error) {
-	payload, err := jwtPart(token, 1)
-	if err != nil {
-		return nil, err
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, err
-	}
-	return claims, nil
-}
-
-func jwtHeaderAlg(token []byte) (string, error) {
-	header, err := jwtPart(token, 0)
-	if err != nil {
-		return "", err
-	}
-	var h struct {
-		Alg string `json:"alg"`
-	}
-	if err := json.Unmarshal(header, &h); err != nil || h.Alg == "" {
-		return "", fmt.Errorf("atproto access token has no alg header")
-	}
-	return h.Alg, nil
-}
-
-func jwtPart(token []byte, i int) ([]byte, error) {
-	parts := strings.Split(string(token), ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("atproto access token is not a JWT")
-	}
-	return base64.RawURLEncoding.DecodeString(parts[i])
-}
-
-func hasJWKSKeys(jwks []byte) bool {
-	var out struct {
-		Keys []json.RawMessage `json:"keys"`
-	}
-	return json.Unmarshal(jwks, &out) == nil && len(out.Keys) > 0
 }
 
 func randB64(n int) string {
